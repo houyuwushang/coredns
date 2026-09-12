@@ -1,0 +1,149 @@
+name: Issue 7844 Test Images
+
+on:
+  push:
+    branches: [test-images-7844]
+    paths:
+      - .github/workflows/test-images-7844.yml
+      - .github/test-images/7844/Corefile
+      - .github/test-images/7844/probe.go
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-images-7844
+  cancel-in-progress: false
+
+jobs:
+  image:
+    if: github.repository == 'houyuwushang/coredns' && github.ref == 'refs/heads/test-images-7844'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: before
+            revision: 19adcd8b960ebd349e4ccbdc04b1a12d77a7e0c0
+            short: 19adcd8b9
+            binary_sha: c8a15de75aa36fe9348e63e4fc2b47dde012b504067ca216fe419be9d989d323
+          - variant: after
+            revision: f59ebacbc7d95b2f9c48220371fa8f5607c8d9d8
+            short: f59ebacbc
+            binary_sha: 48dbbb7062ae673b328d4d404d6fb1b500acd7fd85ba5a4ad4b8c7081c348069
+    env:
+      IMAGE: ghcr.io/houyuwushang/coredns-7844:${{ matrix.variant }}-${{ matrix.short }}-amd64
+      REVISION: ${{ matrix.revision }}
+      BINARY_SHA: ${{ matrix.binary_sha }}
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '2'
+      GOMEMLIMIT: 2GiB
+    steps:
+      - name: Check out image harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out exact tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: coredns/coredns
+          ref: ${{ matrix.revision }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+
+      - name: Install matching Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.27.0'
+          cache-dependency-path: source/go.sum
+
+      - name: Verify source and related tests
+        working-directory: source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$REVISION"
+          test -z "$(git status --porcelain)"
+          go test -race -count=1 -timeout=5m ./plugin/pkg/proxy ./plugin/forward
+
+      - name: Build the previously tested executable
+        working-directory: source
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+          GOAMD64: v1
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/image"
+          go build -p=2 -trimpath -ldflags='-s -w' -o "$RUNNER_TEMP/image/coredns" .
+          chmod 0755 "$RUNNER_TEMP/image/coredns"
+          go version -m "$RUNNER_TEMP/image/coredns"
+          printf '%s  %s\n' "$BINARY_SHA" "$RUNNER_TEMP/image/coredns" | sha256sum -c -
+          go build -trimpath -o "$RUNNER_TEMP/dns-probe" "$GITHUB_WORKSPACE/harness/.github/test-images/7844/probe.go"
+          chmod 0755 "$RUNNER_TEMP/dns-probe"
+          test -z "$(git status --porcelain)"
+
+      - name: Build unofficial comparison image
+        working-directory: source
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 -f Dockerfile \
+            --build-arg DEBIAN_IMAGE=debian@sha256:953e69bf5f91ae4cec5539feb02b11a46f88a2bd638211fb1680c6a2d35604b4 \
+            --build-arg BASE=gcr.io/distroless/static-debian12@sha256:52dcfbabb7457ea47c82f6e13af8c8a4a1d9f7b0145142b3ecab20f2b888411d \
+            --label org.opencontainers.image.source=https://github.com/houyuwushang/coredns \
+            --label "org.opencontainers.image.revision=$REVISION" \
+            --label "org.opencontainers.image.description=Unofficial CoreDNS issue 7844 / PR 8543 comparison image. Testing only; not an official release." \
+            --label org.opencontainers.image.licenses=Apache-2.0 \
+            --tag "$IMAGE" "$RUNNER_TEMP/image"
+
+      - name: Verify restricted non-root UDP and TCP
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE")" = '65532:65532'
+          docker run --rm --network none "$IMAGE" -version
+          container=''
+          cleanup() {
+            if [ -n "$container" ]; then docker rm -f "$container" >/dev/null; fi
+          }
+          trap cleanup EXIT
+          container=$(docker run -d --network none --cap-drop ALL --cap-add NET_BIND_SERVICE \
+            --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/harness/.github/test-images/7844/Corefile,dst=/Corefile,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/dns-probe,dst=/dns-probe,readonly" \
+            "$IMAGE" -conf /Corefile)
+          for attempt in $(seq 1 50); do
+            if docker logs "$container" 2>&1 | grep -q '^CoreDNS-'; then break; fi
+            sleep 0.1
+          done
+          docker logs "$container" 2>&1 | grep -q '^CoreDNS-'
+          docker exec "$container" /dns-probe -net udp
+          docker exec "$container" /dns-probe -net tcp
+
+      - name: Authenticate only after validation
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish and record immutable digest
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE"
+          reference=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+          printf 'Published: %s\n' "$reference"
+          {
+            printf '### %s\n\n' "$IMAGE"
+            printf 'Source: `%s`\n\n' "$REVISION"
+            printf 'Pull: `%s`\n\n' "$reference"
+            printf 'linux/amd64; numeric non-root user; UDP/TCP smoke checks passed.\n'
+            printf 'Unofficial test build. Public visibility and anonymous pull must be verified before sharing.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
