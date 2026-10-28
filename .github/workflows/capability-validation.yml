@@ -1,0 +1,38 @@
+name: Capability validation
+on:
+  push:
+    branches: [validate-bind-capabilities-7435]
+permissions:
+  contents: read
+jobs:
+  baseline:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: master
+            ref: 5e3fa1d3fb3fd634699bb38abab2cb7f638180f6
+          - label: pr7435
+            ref: 2834e1ed16e054724c9f047a74b7f56c6d06290d
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: coredns/coredns
+          ref: ${{ matrix.ref }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: source/.go-version
+          cache-dependency-path: source/go.sum
+      - name: Build exact source
+        working-directory: source
+        run: CGO_ENABLED=0 go build -o ../coredns-test .
+      - name: Check desired compatibility contract
+        run: |
+          caps=$(sed -n 's/^RUN setcap \(.*\) \/coredns/\1/p' source/Dockerfile)
+          sudo unshare --net python3 validation/bind-capabilities.py --binary "$PWD/coredns-test" --caps "$caps" --label '${{ matrix.label }}'
