@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-latest]
+        os: [ubuntu-26.04]
     env:
       COREDNS_KEA_CONFIG_DIR: /etc/kea/coredns-tests
       KEA_PIDFILE_DIR: /run/kea
