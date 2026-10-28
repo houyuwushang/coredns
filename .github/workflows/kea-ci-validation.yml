@@ -1,0 +1,70 @@
+name: Validate Kea CI permissions
+on:
+  push:
+    branches:
+      - validate-kea-ci-permissions-8715
+permissions:
+  contents: read
+jobs:
+  kea:
+    name: Kea permissions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-latest]
+    env:
+      COREDNS_KEA_CONFIG_DIR: /etc/kea/coredns-tests
+      KEA_PIDFILE_DIR: /run/kea
+      KEA_LOCKFILE_DIR: /run/kea
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: .go-version
+      - name: Provision original fixture
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bind9-dnsutils kea-dhcp-ddns-server
+          nsupdate -V
+          kea-dhcp-ddns -v
+          sudo systemctl stop kea-dhcp-ddns-server
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /etc/kea/coredns-tests
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /run/kea
+          sudo install -m 0600 -o "$(id -u)" -g "$(id -g)" /dev/null /run/kea/logger_lockfile
+          test ! -e /run/kea/kea-dhcp-ddns.kea-dhcp-ddns.pid
+      - name: Record original permissions and AppArmor
+        run: |
+          id
+          cat /etc/os-release
+          dpkg-query -W kea-common kea-dhcp-ddns-server
+          sudo namei -l /etc/kea/coredns-tests
+          sudo stat -c '%a %U %G %n' /etc/kea /etc/kea/coredns-tests /run/kea
+          sudo grep 'kea-dhcp-ddns.*(enforce)' /sys/kernel/security/apparmor/profiles
+      - name: Exercise unchanged Kea test before fix
+        run: |
+          set +e
+          go test -race ./test -run '^TestDynUpdateKeaLifecycle$' -count=1 -v > "$RUNNER_TEMP/kea-before.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/kea-before.log"
+          if test -x /etc/kea; then
+            test "$result" -eq 0
+          else
+            test "$result" -ne 0
+            grep -E 'mkdir /etc/kea/coredns-tests/.*permission denied' "$RUNNER_TEMP/kea-before.log"
+          fi
+      - name: Enable traversal of the parent config directory
+        run: |
+          sudo chmod o+x /etc/kea
+          sudo stat -c '%a %U %G %n' /etc/kea /etc/kea/coredns-tests
+          probe=$(mktemp -d /etc/kea/coredns-tests/access-check.XXXXXX)
+          rmdir "$probe"
+          sudo grep 'kea-dhcp-ddns.*(enforce)' /sys/kernel/security/apparmor/profiles
+      - name: Verify Kea lifecycle with the fix
+        run: go test -race ./test -run '^TestDynUpdateKeaLifecycle$' -count=1 -v
+      - name: Run complete e2e suite
+        run: go test -race ./test -count=1
