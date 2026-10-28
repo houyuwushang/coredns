@@ -18,7 +18,7 @@ jobs:
         with:
           persist-credentials: false
           repository: houyuwushang/coredns
-          ref: 20a5b2ddab299335d2d1c35e7cd525fde189ccfa
+          ref: af052f7b203718d6e9af71c81b7e751727394e20
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
           go-version-file: .go-version
